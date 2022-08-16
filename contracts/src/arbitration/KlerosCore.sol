@@ -757,16 +757,14 @@ contract KlerosCore is IArbitrator {
         uint256 _disputeID,
         uint256 _round,
         uint256 i,
-        uint256 numberOfVotesInRound,
-        uint256 coherentCount,
         uint256 penaltiesInRoundCache
     ) internal returns (uint256) {
         Dispute storage dispute = disputes[_disputeID];
         Round storage round = dispute.rounds[_round];
         IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
 
-        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
         // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
+        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
         if (degreeOfCoherence > ALPHA_DIVISOR) {
             degreeOfCoherence = ALPHA_DIVISOR;
         }
@@ -778,10 +776,7 @@ contract KlerosCore is IArbitrator {
         jurors.unlockTokens(account, dispute.subcourtID, penalty); // Release this part of locked tokens.
 
         // Can only update the stake if it is able to cover the minStake and penalty, otherwise unstake from the court.
-        (
-            uint256 staked, /* locked */
-
-        ) = jurors.getBalance(account, dispute.subcourtID);
+        (uint256 staked, ) = jurors.getBalance(account, dispute.subcourtID);
         if (staked >= courts[dispute.subcourtID].minStake + penalty) {
             uint256 newStake = staked - penalty;
             setStakeForAccount(account, dispute.subcourtID, newStake, penalty);
@@ -798,14 +793,6 @@ contract KlerosCore is IArbitrator {
         }
 
         emit TokenAndETHShift(account, _disputeID, -int256(penalty), 0);
-
-        if (i == numberOfVotesInRound - 1) {
-            if (coherentCount == 0) {
-                // No one was coherent. Send the rewards to governor.
-                payable(governor).send(round.totalFeesForJurors);
-                pinakion.safeTransfer(governor, penaltiesInRoundCache + penalty);
-            }
-        }
         return penaltiesInRoundCache + penalty;
     }
 
@@ -813,7 +800,6 @@ contract KlerosCore is IArbitrator {
         uint256 _disputeID,
         uint256 _round,
         uint256 i,
-        uint256 numberOfVotesInRound,
         uint256 coherentCount,
         uint256 penaltiesInRoundCache
     ) internal {
@@ -821,16 +807,14 @@ contract KlerosCore is IArbitrator {
         Round storage round = dispute.rounds[_round];
         IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
 
-        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i % numberOfVotesInRound); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
-
         // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
+        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
         if (degreeOfCoherence > ALPHA_DIVISOR) {
             degreeOfCoherence = ALPHA_DIVISOR;
         }
 
-        address account = round.drawnJurors[i % numberOfVotesInRound]; // Address of the juror.
-
         // Release the rest of the tokens of the juror for this round.
+        address account = round.drawnJurors[i]; // Address of the juror.
         jurors.unlockTokens(
             account,
             dispute.subcourtID,
@@ -838,10 +822,7 @@ contract KlerosCore is IArbitrator {
         );
 
         // Give back the locked tokens in case the juror fully unstaked earlier.
-        (
-            uint256 staked, /* locked */
-
-        ) = jurors.getBalance(account, dispute.subcourtID);
+        (uint256 staked, ) = jurors.getBalance(account, dispute.subcourtID);
         if (staked == 0) {
             uint256 tokenLocked = (round.tokensAtStakePerJuror * degreeOfCoherence) / ALPHA_DIVISOR;
             pinakion.safeTransfer(account, tokenLocked);
@@ -870,40 +851,34 @@ contract KlerosCore is IArbitrator {
         Round storage round = dispute.rounds[_round];
         IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
 
-        uint256 coherentCount = disputeKit.getCoherentCount(_disputeID, _round); // Total number of jurors that are eligible to a reward in this round.
         uint256 end = round.executedVotes + _iterations;
-        uint256 numberOfVotesInRound = round.drawnJurors.length;
-        if (coherentCount == 0) {
-            // We loop over the votes once as there are no rewards because it is not a tie and no one in this round is coherent with the final outcome.
-            if (end > numberOfVotesInRound) end = numberOfVotesInRound;
-        } else {
-            // We loop over the votes twice, first to collect penalties, and second to distribute them as rewards along with arbitration fees.
-            if (end > numberOfVotesInRound * 2) end = numberOfVotesInRound * 2;
-        }
+        uint256 votesInRound = round.drawnJurors.length;
+        if (end > votesInRound) end = votesInRound;
 
+        uint256 coherentCount = disputeKit.getCoherentCount(_disputeID, _round); // Total number of jurors that are eligible to a reward in this round.
         uint256 penaltiesInRoundCache = round.penalties; // For saving gas.
 
         for (uint256 i = round.executedVotes; i < end; i++) {
-            if (i < numberOfVotesInRound) {
-                // Penalty.
-                penaltiesInRoundCache = executePenalty(
-                    _disputeID,
-                    _round,
-                    i,
-                    numberOfVotesInRound,
-                    coherentCount,
-                    penaltiesInRoundCache
-                );
-            } else {
-                // Reward.
-                executeReward(_disputeID, _round, i, numberOfVotesInRound, coherentCount, penaltiesInRoundCache);
+            penaltiesInRoundCache = executePenalty(_disputeID, _round, i, penaltiesInRoundCache);
+        }
+
+        if (coherentCount != 0) {
+            for (uint256 i = round.executedVotes; i < end; i++) {
+                executeReward(_disputeID, _round, i, coherentCount, penaltiesInRoundCache);
             }
+            round.executedVotes = end * 2; // penalties + rewards iterations
+        } else {
+            if (end == votesInRound) {
+                // Last iteration for this round: no one was coherent, send the rewards to governor.
+                payable(governor).send(round.totalFeesForJurors);
+                pinakion.safeTransfer(governor, penaltiesInRoundCache);
+            }
+            round.executedVotes = end; // penalties iterations only
         }
 
         if (round.penalties != penaltiesInRoundCache) {
             round.penalties = penaltiesInRoundCache;
         }
-        round.executedVotes = end;
     }
 
     /** @dev Executes a specified dispute's ruling. UNTRUSTED.
