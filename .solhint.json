@@ -4,18 +4,27 @@
     "prettier"
   ],
   "rules": {
-    "prettier/prettier": "error",
-    "max-line-length": "off",
-    "check-send-result": "off",
-    "not-rely-on-time": "off",
-    "multiple-sends": "off",
-    "compiler-version": "off",
-    "quotes": "warn",
+    "compiler-version": [
+      "error",
+      "^0.8.0"
+    ],
     "func-visibility": [
       "error",
       {
         "ignoreConstructors": true
       }
-    ]
+    ],
+    "reason-string": [
+      "warn",
+      {
+        "maxLength": 32
+      }
+    ],
+    "prettier/prettier": "error",
+    "quotes": "warn",
+    "max-line-length": "off",
+    "check-send-result": "off",
+    "not-rely-on-time": "off",
+    "multiple-sends": "off"
   }
 }
