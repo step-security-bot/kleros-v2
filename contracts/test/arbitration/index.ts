@@ -83,12 +83,16 @@ async function deployContracts(deployer) {
   await disputeKit.deployed();
 
   const sortitionSumTreeLibraryFactory = await ethers.getContractFactory("SortitionSumTreeFactory", deployer);
-  const library = await sortitionSumTreeLibraryFactory.deploy();
+  const sortitionSumTreeLibrary = await sortitionSumTreeLibraryFactory.deploy();
+
+  const jurorAccountsLibraryFactory = await ethers.getContractFactory("JurorAccounts", deployer);
+  const jurorAccountsLibrary = await jurorAccountsLibraryFactory.deploy();
 
   const klerosCoreFactory = await ethers.getContractFactory("KlerosCore", {
     signer: deployer,
     libraries: {
-      SortitionSumTreeFactory: library.address,
+      SortitionSumTreeFactory: sortitionSumTreeLibrary.address,
+      JurorAccounts: jurorAccountsLibrary.address,
     },
   });
   const core = await klerosCoreFactory.deploy(

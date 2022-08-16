@@ -14,6 +14,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./IArbitrator.sol";
 import "./IDisputeKit.sol";
 import {SortitionSumTreeFactory} from "../data-structures/SortitionSumTreeFactory.sol";
+import {JurorAccounts} from "../data-structures/JurorAccounts.sol";
+import "../data-structures/ERC20SafeTransfer.sol";
 
 /**
  *  @title KlerosCore
@@ -22,6 +24,8 @@ import {SortitionSumTreeFactory} from "../data-structures/SortitionSumTreeFactor
  */
 contract KlerosCore is IArbitrator {
     using SortitionSumTreeFactory for SortitionSumTreeFactory.SortitionSumTrees; // Use library functions for sortition sum trees.
+    using JurorAccounts for JurorAccounts.Jurors;
+    using ERC20SafeTransfer for IERC20;
 
     // ************************************* //
     // *         Enums / Structs           * //
@@ -66,15 +70,9 @@ contract KlerosCore is IArbitrator {
         uint256 tokensAtStakePerJuror; // The amount of tokens at stake for each juror in this round.
         uint256 totalFeesForJurors; // The total juror fees paid in this round.
         uint256 nbVotes; // The total number of votes the dispute can possibly have in the current round. Former votes[_round].length.
-        uint256 repartitions; // A counter of reward repartitions made in this round.
+        uint256 executedVotes; // A counter executed votes among the drawn jurors.
         uint256 penalties; // The amount of tokens collected from penalties in this round.
         address[] drawnJurors; // Addresses of the jurors that were drawn in this round.
-    }
-
-    struct Juror {
-        uint96[] subcourtIDs; // The IDs of subcourts where the juror's stake path ends. A stake path is a path from the general court to a court the juror directly staked in using `_setStake`.
-        mapping(uint96 => uint256) stakedTokens; // The number of tokens the juror has staked in the subcourt in the form `stakedTokens[subcourtID]`.
-        mapping(uint96 => uint256) lockedTokens; // The number of tokens the juror has locked in the subcourt in the form `lockedTokens[subcourtID]`.
     }
 
     struct DisputeKitNode {
@@ -85,13 +83,6 @@ contract KlerosCore is IArbitrator {
         uint256 depthLevel; // How far this DK is from the root. 0 for root DK.
     }
 
-    struct DelayedStake {
-        address account; // The address of the juror.
-        uint96 subcourtID; // The ID of the subcourt.
-        uint256 stake; // The new stake.
-        uint256 penalty; // Penalty value, in case the stake was set during execution.
-    }
-
     // ************************************* //
     // *             Storage               * //
     // ************************************* //
@@ -100,7 +91,6 @@ contract KlerosCore is IArbitrator {
     uint96 public constant GENERAL_COURT = 1; // Index of the default (general) court.
     uint256 public constant NULL_DISPUTE_KIT = 0; // Null pattern to indicate a top-level DK which has no parent.
     uint256 public constant DISPUTE_KIT_CLASSIC = 1; // Index of the default DK. 0 index is skipped.
-    uint256 public constant MAX_STAKE_PATHS = 4; // The maximum number of stake paths a juror can have.
     uint256 public constant MIN_JURORS = 3; // The global default minimum number of jurors in a dispute.
     uint256 public constant ALPHA_DIVISOR = 1e4; // The number to divide `Court.alpha` by.
     uint256 public constant NON_PAYABLE_AMOUNT = (2**256 - 2) / 2; // An amount higher than the supply of ETH.
@@ -119,12 +109,8 @@ contract KlerosCore is IArbitrator {
     DisputeKitNode[] public disputeKitNodes; // The list of DisputeKitNode, indexed by DisputeKitID.
     uint256[] public disputesKitIDsThatNeedFreezing; // The disputeKitIDs that need switching to Freezing phase.
     Dispute[] public disputes; // The disputes.
-    mapping(address => Juror) internal jurors; // The jurors.
+    JurorAccounts.Jurors internal jurors; // The jurors.
     SortitionSumTreeFactory.SortitionSumTrees internal sortitionSumTrees; // The sortition sum trees.
-    mapping(uint256 => DelayedStake) public delayedStakes; // Stores the stakes that were changed during Freezing phase, to update them when the phase is switched to Staking.
-
-    uint256 public delayedStakeWriteIndex; // The index of the last `delayedStake` item that was written to the array. 0 index is skipped.
-    uint256 public delayedStakeReadIndex = 1; // The index of the next `delayedStake` item that should be processed. Starts at 1 because 0 index is skipped.
 
     // ************************************* //
     // *              Events               * //
@@ -211,6 +197,7 @@ contract KlerosCore is IArbitrator {
         minStakingTime = _phaseTimeouts[0];
         maxFreezingTime = _phaseTimeouts[1];
         lastPhaseChange = block.timestamp;
+        jurors.initialize(_pinakion);
 
         // NULL_DISPUTE_KIT: an empty element at index 0 to indicate when a node has no parent.
         disputeKitNodes.push();
@@ -483,7 +470,6 @@ contract KlerosCore is IArbitrator {
         uint256[] memory _disputeKitIDs,
         bool _enable
     ) external onlyByGovernor {
-        Court storage subcourt = courts[_subcourtID];
         for (uint256 i = 0; i < _disputeKitIDs.length; i++) {
             if (_enable) {
                 require(_disputeKitIDs[i] > 0 && _disputeKitIDs[i] < disputeKitNodes.length, "Wrong DK index");
@@ -516,17 +502,11 @@ contract KlerosCore is IArbitrator {
     function executeDelayedStakes(uint256 _iterations) external {
         require(phase == Phase.staking, "Should be in Staking phase.");
 
-        uint256 actualIterations = (delayedStakeReadIndex + _iterations) - 1 > delayedStakeWriteIndex
-            ? (delayedStakeWriteIndex - delayedStakeReadIndex) + 1
-            : _iterations;
-        uint256 newDelayedStakeReadIndex = delayedStakeReadIndex + actualIterations;
-
-        for (uint256 i = delayedStakeReadIndex; i < newDelayedStakeReadIndex; i++) {
-            DelayedStake storage delayedStake = delayedStakes[i];
-            setStakeForAccount(delayedStake.account, delayedStake.subcourtID, delayedStake.stake, delayedStake.penalty);
-            delete delayedStakes[i];
+        (uint256 startIndex, uint256 endIndex) = jurors.readDelayedStakes(_iterations);
+        for (uint256 i = startIndex; i < endIndex; i++) {
+            (address account, uint96 subcourtID, uint256 stake, uint256 penalty) = jurors.popDelayedStake(i);
+            setStakeForAccount(account, subcourtID, stake, penalty);
         }
-        delayedStakeReadIndex = newDelayedStakeReadIndex;
     }
 
     /** @dev Creates a dispute. Must be called by the arbitrable contract.
@@ -680,7 +660,7 @@ contract KlerosCore is IArbitrator {
             address drawnAddress = disputeKit.draw(_disputeID);
             if (drawnAddress != address(0)) {
                 // In case no one has staked at the court yet.
-                jurors[drawnAddress].lockedTokens[dispute.subcourtID] += round.tokensAtStakePerJuror;
+                jurors.lockTokens(drawnAddress, dispute.subcourtID, round.tokensAtStakePerJuror);
                 round.drawnJurors.push(drawnAddress);
                 emit Draw(drawnAddress, _disputeID, currentRound, i);
             }
@@ -773,6 +753,107 @@ contract KlerosCore is IArbitrator {
         emit NewPeriod(_disputeID, Period.evidence);
     }
 
+    function executePenalty(
+        uint256 _disputeID,
+        uint256 _round,
+        uint256 i,
+        uint256 numberOfVotesInRound,
+        uint256 coherentCount,
+        uint256 penaltiesInRoundCache
+    ) internal returns (uint256) {
+        Dispute storage dispute = disputes[_disputeID];
+        Round storage round = dispute.rounds[_round];
+        IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
+
+        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
+        // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
+        if (degreeOfCoherence > ALPHA_DIVISOR) {
+            degreeOfCoherence = ALPHA_DIVISOR;
+        }
+
+        // Fully coherent jurors won't be penalized.
+        uint256 penalty = (round.tokensAtStakePerJuror * (ALPHA_DIVISOR - degreeOfCoherence)) / ALPHA_DIVISOR;
+
+        address account = round.drawnJurors[i]; // Address of the juror.
+        jurors.unlockTokens(account, dispute.subcourtID, penalty); // Release this part of locked tokens.
+
+        // Can only update the stake if it is able to cover the minStake and penalty, otherwise unstake from the court.
+        (
+            uint256 staked, /* locked */
+
+        ) = jurors.getBalance(account, dispute.subcourtID);
+        if (staked >= courts[dispute.subcourtID].minStake + penalty) {
+            uint256 newStake = staked - penalty;
+            setStakeForAccount(account, dispute.subcourtID, newStake, penalty);
+        } else if (staked != 0) {
+            setStakeForAccount(account, dispute.subcourtID, 0, penalty);
+        }
+
+        // Unstake the juror if he lost due to inactivity.
+        if (!disputeKit.isVoteActive(_disputeID, _round, i)) {
+            uint96[] memory subcourtIDs = jurors.getStakedSubcourts(account);
+            for (uint256 j = 0; j < subcourtIDs.length; j++) {
+                setStakeForAccount(account, subcourtIDs[j], 0, 0);
+            }
+        }
+
+        emit TokenAndETHShift(account, _disputeID, -int256(penalty), 0);
+
+        if (i == numberOfVotesInRound - 1) {
+            if (coherentCount == 0) {
+                // No one was coherent. Send the rewards to governor.
+                payable(governor).send(round.totalFeesForJurors);
+                pinakion.safeTransfer(governor, penaltiesInRoundCache + penalty);
+            }
+        }
+        return penaltiesInRoundCache + penalty;
+    }
+
+    function executeReward(
+        uint256 _disputeID,
+        uint256 _round,
+        uint256 i,
+        uint256 numberOfVotesInRound,
+        uint256 coherentCount,
+        uint256 penaltiesInRoundCache
+    ) internal {
+        Dispute storage dispute = disputes[_disputeID];
+        Round storage round = dispute.rounds[_round];
+        IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
+
+        uint256 degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i % numberOfVotesInRound); // [0, 1] value that determines how coherent the juror was in this round, in basis points.
+
+        // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
+        if (degreeOfCoherence > ALPHA_DIVISOR) {
+            degreeOfCoherence = ALPHA_DIVISOR;
+        }
+
+        address account = round.drawnJurors[i % numberOfVotesInRound]; // Address of the juror.
+
+        // Release the rest of the tokens of the juror for this round.
+        jurors.unlockTokens(
+            account,
+            dispute.subcourtID,
+            (round.tokensAtStakePerJuror * degreeOfCoherence) / ALPHA_DIVISOR
+        );
+
+        // Give back the locked tokens in case the juror fully unstaked earlier.
+        (
+            uint256 staked, /* locked */
+
+        ) = jurors.getBalance(account, dispute.subcourtID);
+        if (staked == 0) {
+            uint256 tokenLocked = (round.tokensAtStakePerJuror * degreeOfCoherence) / ALPHA_DIVISOR;
+            pinakion.safeTransfer(account, tokenLocked);
+        }
+
+        uint256 tokenReward = ((penaltiesInRoundCache / coherentCount) * degreeOfCoherence) / ALPHA_DIVISOR;
+        uint256 ethReward = ((round.totalFeesForJurors / coherentCount) * degreeOfCoherence) / ALPHA_DIVISOR;
+        pinakion.safeTransfer(account, tokenReward);
+        payable(account).send(ethReward);
+        emit TokenAndETHShift(account, _disputeID, int256(tokenReward), int256(ethReward));
+    }
+
     /** @dev Distribute tokens and ETH for the specific round of the dispute. Can be called in parts.
      *  @param _disputeID The ID of the dispute.
      *  @param _round The appeal round.
@@ -789,14 +870,9 @@ contract KlerosCore is IArbitrator {
         Round storage round = dispute.rounds[_round];
         IDisputeKit disputeKit = disputeKitNodes[round.disputeKitID].disputeKit;
 
-        uint256 end = round.repartitions + _iterations;
-        uint256 penaltiesInRoundCache = round.penalties; // For saving gas.
-        uint256 numberOfVotesInRound = round.drawnJurors.length;
         uint256 coherentCount = disputeKit.getCoherentCount(_disputeID, _round); // Total number of jurors that are eligible to a reward in this round.
-
-        address account; // Address of the juror.
-        uint256 degreeOfCoherence; // [0, 1] value that determines how coherent the juror was in this round, in basis points.
-
+        uint256 end = round.executedVotes + _iterations;
+        uint256 numberOfVotesInRound = round.drawnJurors.length;
         if (coherentCount == 0) {
             // We loop over the votes once as there are no rewards because it is not a tie and no one in this round is coherent with the final outcome.
             if (end > numberOfVotesInRound) end = numberOfVotesInRound;
@@ -805,80 +881,29 @@ contract KlerosCore is IArbitrator {
             if (end > numberOfVotesInRound * 2) end = numberOfVotesInRound * 2;
         }
 
-        for (uint256 i = round.repartitions; i < end; i++) {
+        uint256 penaltiesInRoundCache = round.penalties; // For saving gas.
+
+        for (uint256 i = round.executedVotes; i < end; i++) {
             if (i < numberOfVotesInRound) {
                 // Penalty.
-                degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i);
-
-                // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
-                if (degreeOfCoherence > ALPHA_DIVISOR) {
-                    degreeOfCoherence = ALPHA_DIVISOR;
-                }
-
-                // Fully coherent jurors won't be penalized.
-                uint256 penalty = (round.tokensAtStakePerJuror * (ALPHA_DIVISOR - degreeOfCoherence)) / ALPHA_DIVISOR;
-                penaltiesInRoundCache += penalty;
-
-                account = round.drawnJurors[i];
-                jurors[account].lockedTokens[dispute.subcourtID] -= penalty; // Release this part of locked tokens.
-
-                // Can only update the stake if it is able to cover the minStake and penalty, otherwise unstake from the court.
-                if (jurors[account].stakedTokens[dispute.subcourtID] >= courts[dispute.subcourtID].minStake + penalty) {
-                    uint256 newStake = jurors[account].stakedTokens[dispute.subcourtID] - penalty;
-                    setStakeForAccount(account, dispute.subcourtID, newStake, penalty);
-                } else if (jurors[account].stakedTokens[dispute.subcourtID] != 0) {
-                    setStakeForAccount(account, dispute.subcourtID, 0, penalty);
-                }
-
-                // Unstake the juror if he lost due to inactivity.
-                if (!disputeKit.isVoteActive(_disputeID, _round, i)) {
-                    for (uint256 j = 0; j < jurors[account].subcourtIDs.length; j++) {
-                        setStakeForAccount(account, jurors[account].subcourtIDs[j], 0, 0);
-                    }
-                }
-                emit TokenAndETHShift(account, _disputeID, -int256(penalty), 0);
-
-                if (i == numberOfVotesInRound - 1) {
-                    if (coherentCount == 0) {
-                        // No one was coherent. Send the rewards to governor.
-                        payable(governor).send(round.totalFeesForJurors);
-                        safeTransfer(governor, penaltiesInRoundCache);
-                    }
-                }
+                penaltiesInRoundCache = executePenalty(
+                    _disputeID,
+                    _round,
+                    i,
+                    numberOfVotesInRound,
+                    coherentCount,
+                    penaltiesInRoundCache
+                );
             } else {
                 // Reward.
-                degreeOfCoherence = disputeKit.getDegreeOfCoherence(_disputeID, _round, i % numberOfVotesInRound);
-
-                // Make sure the degree doesn't exceed 1, though it should be ensured by the dispute kit.
-                if (degreeOfCoherence > ALPHA_DIVISOR) {
-                    degreeOfCoherence = ALPHA_DIVISOR;
-                }
-
-                account = round.drawnJurors[i % numberOfVotesInRound];
-
-                // Release the rest of the tokens of the juror for this round.
-                jurors[account].lockedTokens[dispute.subcourtID] -=
-                    (round.tokensAtStakePerJuror * degreeOfCoherence) /
-                    ALPHA_DIVISOR;
-
-                // Give back the locked tokens in case the juror fully unstaked earlier.
-                if (jurors[account].stakedTokens[dispute.subcourtID] == 0) {
-                    uint256 tokenLocked = (round.tokensAtStakePerJuror * degreeOfCoherence) / ALPHA_DIVISOR;
-                    safeTransfer(account, tokenLocked);
-                }
-
-                uint256 tokenReward = ((penaltiesInRoundCache / coherentCount) * degreeOfCoherence) / ALPHA_DIVISOR;
-                uint256 ethReward = ((round.totalFeesForJurors / coherentCount) * degreeOfCoherence) / ALPHA_DIVISOR;
-                safeTransfer(account, tokenReward);
-                payable(account).send(ethReward);
-                emit TokenAndETHShift(account, _disputeID, int256(tokenReward), int256(ethReward));
+                executeReward(_disputeID, _round, i, numberOfVotesInRound, coherentCount, penaltiesInRoundCache);
             }
         }
 
         if (round.penalties != penaltiesInRoundCache) {
             round.penalties = penaltiesInRoundCache;
         }
-        round.repartitions = end;
+        round.executedVotes = end;
     }
 
     /** @dev Executes a specified dispute's ruling. UNTRUSTED.
@@ -935,7 +960,7 @@ contract KlerosCore is IArbitrator {
      *  @return start The start of the appeal period.
      *  @return end The end of the appeal period.
      */
-    function appealPeriod(uint256 _disputeID) public view returns (uint256 start, uint256 end) {
+    function appealPeriod(uint256 _disputeID) external view returns (uint256 start, uint256 end) {
         Dispute storage dispute = disputes[_disputeID];
         if (dispute.period == Period.appeal) {
             start = dispute.lastPeriodChange;
@@ -963,7 +988,7 @@ contract KlerosCore is IArbitrator {
         returns (
             uint256 tokensAtStakePerJuror,
             uint256 totalFeesForJurors,
-            uint256 repartitions,
+            uint256 executedVotes,
             uint256 penalties,
             address[] memory drawnJurors,
             uint256 disputeKitID
@@ -974,7 +999,7 @@ contract KlerosCore is IArbitrator {
         return (
             round.tokensAtStakePerJuror,
             round.totalFeesForJurors,
-            round.repartitions,
+            round.executedVotes,
             round.penalties,
             round.drawnJurors,
             round.disputeKitID
@@ -991,9 +1016,7 @@ contract KlerosCore is IArbitrator {
         view
         returns (uint256 staked, uint256 locked)
     {
-        Juror storage juror = jurors[_juror];
-        staked = juror.stakedTokens[_subcourtID];
-        locked = juror.lockedTokens[_subcourtID];
+        return jurors.getBalance(_juror, _subcourtID);
     }
 
     function isSupported(uint96 _subcourtID, uint256 _disputeKitID) external view returns (bool) {
@@ -1021,31 +1044,16 @@ contract KlerosCore is IArbitrator {
     // *   Public Views for Dispute Kits   * //
     // ************************************* //
 
-    function getSortitionSumTreeK(bytes32 _key) public view returns (uint256) {
+    function getSortitionSumTreeK(bytes32 _key) external view returns (uint256) {
         return sortitionSumTrees.sortitionSumTrees[_key].K;
     }
 
-    function getSortitionSumTreeNode(bytes32 _key, uint256 _index) public view returns (uint256) {
+    function getSortitionSumTreeNode(bytes32 _key, uint256 _index) external view returns (uint256) {
         return sortitionSumTrees.sortitionSumTrees[_key].nodes[_index];
     }
 
-    function getSortitionSumTreeNodesLength(bytes32 _key) public view returns (uint256) {
+    function getSortitionSumTreeNodesLength(bytes32 _key) external view returns (uint256) {
         return sortitionSumTrees.sortitionSumTrees[_key].nodes.length;
-    }
-
-    function getSortitionSumTree(bytes32 _key)
-        public
-        view
-        returns (
-            uint256 K,
-            uint256[] memory stack,
-            uint256[] memory nodes
-        )
-    {
-        SortitionSumTreeFactory.SortitionSumTree storage tree = sortitionSumTrees.sortitionSumTrees[_key];
-        K = tree.K;
-        stack = tree.stack;
-        nodes = tree.nodes;
     }
 
     // TODO: some getters can be merged into a single function
@@ -1086,7 +1094,7 @@ contract KlerosCore is IArbitrator {
      *  @param _disputeID The ID of the dispute.
      *  @return Whether DK will be switched or not.
      */
-    function isDisputeKitJumping(uint256 _disputeID) public view returns (bool) {
+    function isDisputeKitJumping(uint256 _disputeID) external view returns (bool) {
         Dispute storage dispute = disputes[_disputeID];
         Round storage round = dispute.rounds[dispute.rounds.length - 1];
         Court storage court = courts[dispute.subcourtID];
@@ -1145,72 +1153,25 @@ contract KlerosCore is IArbitrator {
         uint256 _penalty
     ) internal returns (bool succeeded) {
         if (_subcourtID == FORKING_COURT || _subcourtID > courts.length) return false;
+        if (_stake != 0 && _stake < courts[_subcourtID].minStake) return false;
 
-        Juror storage juror = jurors[_account];
         bytes32 stakePathID = accountAndSubcourtIDToStakePathID(_account, _subcourtID);
         uint256 currentStake = sortitionSumTrees.stakeOf(bytes32(uint256(_subcourtID)), stakePathID);
 
-        if (_stake != 0) {
-            // Check against locked tokens in case the min stake was lowered.
-            if (_stake < courts[_subcourtID].minStake || _stake < juror.lockedTokens[_subcourtID]) return false;
-            if (currentStake == 0 && juror.subcourtIDs.length >= MAX_STAKE_PATHS) return false;
-        }
-
-        // Delayed action logic.
-        if (phase != Phase.staking) {
-            delayedStakes[++delayedStakeWriteIndex] = DelayedStake({
-                account: _account,
-                subcourtID: _subcourtID,
-                stake: _stake,
-                penalty: _penalty
-            });
-            return true;
-        }
-
-        uint256 transferredAmount;
-        if (_stake >= currentStake) {
-            transferredAmount = _stake - currentStake;
-            if (transferredAmount > 0) {
-                if (safeTransferFrom(_account, address(this), transferredAmount)) {
-                    if (currentStake == 0) {
-                        juror.subcourtIDs.push(_subcourtID);
-                    }
-                } else {
-                    return false;
-                }
-            }
-        } else if (_stake == 0) {
-            // Keep locked tokens in the contract and release them after dispute is executed.
-            transferredAmount = currentStake - juror.lockedTokens[_subcourtID] - _penalty;
-            if (transferredAmount > 0) {
-                if (safeTransfer(_account, transferredAmount)) {
-                    for (uint256 i = 0; i < juror.subcourtIDs.length; i++) {
-                        if (juror.subcourtIDs[i] == _subcourtID) {
-                            juror.subcourtIDs[i] = juror.subcourtIDs[juror.subcourtIDs.length - 1];
-                            juror.subcourtIDs.pop();
-                            break;
-                        }
-                    }
-                } else {
-                    return false;
-                }
-            }
-        } else {
-            transferredAmount = currentStake - _stake - _penalty;
-            if (transferredAmount > 0) {
-                if (!safeTransfer(_account, transferredAmount)) {
-                    return false;
-                }
-            }
-        }
-
-        // Update juror's records.
-        uint256 newTotalStake = juror.stakedTokens[_subcourtID] - currentStake + _stake;
-        juror.stakedTokens[_subcourtID] = newTotalStake;
+        bool delayed = (phase != Phase.staking);
+        (bool success, uint256 newTotalStake) = jurors.setStakeForAccount(
+            _account,
+            _subcourtID,
+            currentStake,
+            _stake,
+            _penalty,
+            delayed
+        );
+        if (delayed || !success) return success;
 
         // Update subcourt parents.
-        bool finished = false;
         uint256 currentSubcourtID = _subcourtID;
+        bool finished = false;
         while (!finished) {
             sortitionSumTrees.set(bytes32(currentSubcourtID), _stake, stakePathID);
             if (currentSubcourtID == GENERAL_COURT) finished = true;
@@ -1218,7 +1179,6 @@ contract KlerosCore is IArbitrator {
         }
 
         emit StakeSet(_account, _subcourtID, _stake, newTotalStake);
-
         return true;
     }
 
@@ -1291,34 +1251,5 @@ contract KlerosCore is IArbitrator {
             }
             stakePathID := mload(ptr)
         }
-    }
-
-    /** @dev Calls transfer() without reverting.
-     *  @param _to Recepient address.
-     *  @param _value Amount transferred.
-     *  @return Whether transfer succeeded or not.
-     */
-    function safeTransfer(address _to, uint256 _value) internal returns (bool) {
-        (bool success, bytes memory data) = address(pinakion).call(
-            abi.encodeWithSelector(IERC20.transfer.selector, _to, _value)
-        );
-        return (success && (data.length == 0 || abi.decode(data, (bool))));
-    }
-
-    /** @dev Calls transferFrom() without reverting.
-     *  @param _from Sender address.
-     *  @param _to Recepient address.
-     *  @param _value Amount transferred.
-     *  @return Whether transfer succeeded or not.
-     */
-    function safeTransferFrom(
-        address _from,
-        address _to,
-        uint256 _value
-    ) internal returns (bool) {
-        (bool success, bytes memory data) = address(pinakion).call(
-            abi.encodeWithSelector(IERC20.transferFrom.selector, _from, _to, _value)
-        );
-        return (success && (data.length == 0 || abi.decode(data, (bool))));
     }
 }

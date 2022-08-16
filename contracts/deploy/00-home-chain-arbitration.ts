@@ -42,6 +42,16 @@ const deployArbitration: DeployFunction = async (hre: HardhatRuntimeEnvironment)
     log: true,
   });
 
+  const safeTransferLibrary = await deploy("ERC20SafeTransfer", {
+    from: deployer,
+    log: true,
+  });
+
+  const jurorAccountsLibrary = await deploy("JurorAccounts", {
+    from: deployer,
+    log: true,
+  });
+
   if (chainId === HomeChains.HARDHAT) {
     pnkByChain.set(
       HomeChains.HARDHAT,
@@ -61,6 +71,8 @@ const deployArbitration: DeployFunction = async (hre: HardhatRuntimeEnvironment)
     from: deployer,
     libraries: {
       SortitionSumTreeFactory: sortitionSumTreeLibrary.address,
+      ERC20SafeTransfer: safeTransferLibrary.address,
+      JurorAccounts: jurorAccountsLibrary.address,
     },
     args: [
       deployer,
