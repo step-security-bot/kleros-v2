@@ -1,3 +1,4 @@
+name: "Bots Deployment to AWS"
 on: [workflow_dispatch]
 
 jobs:
