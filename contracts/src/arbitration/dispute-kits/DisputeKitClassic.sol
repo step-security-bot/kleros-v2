@@ -18,7 +18,7 @@ import "../../evidence/IEvidence.sol";
  *  @title DisputeKitClassic
  *  Dispute kit implementation of the Kleros v1 features including:
  *  - a drawing system: proportional to staked PNK,
- *  - a vote aggreation system: plurality,
+ *  - a vote aggregation system: plurality,
  *  - an incentive system: equal split between coherent votes,
  *  - an appeal system: fund 2 choices only, vote on any choice.
  */
@@ -475,7 +475,7 @@ contract DisputeKitClassic is BaseDisputeKit, IEvidence {
     }
 
     /** @dev Submits evidence.
-     *  @param _evidenceGroupID Unique identifier of the evidence group the evidence belongs to. It's the submitter responsability to submit the right evidence group ID.
+     *  @param _evidenceGroupID Unique identifier of the evidence group the evidence belongs to. It's the submitter responsibility to submit the right evidence group ID.
      *  @param _evidence IPFS path to evidence, example: '/ipfs/Qmarwkf7C9RuzDEJNnarT3WZ7kem5bk8DZAzx78acJjMFH/evidence.json'.
      */
     function submitEvidence(uint256 _evidenceGroupID, string calldata _evidence) external {
