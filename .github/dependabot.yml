@@ -60,3 +60,48 @@ updates:
       - dependencies
     assignees:
       - jaybuidl
+
+  - package-ecosystem: npm
+    directory: /bot-pinner
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /contracts
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /eslint-config
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /kleros-sdk
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /prettier-config
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /services/bots/base
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /subgraph
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /tsconfig
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: daily
